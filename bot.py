@@ -1,3 +1,4 @@
+# Quiz bot (Korean vocabulary)
 import asyncio
 import csv
 import json
