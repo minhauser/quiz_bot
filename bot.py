@@ -452,7 +452,6 @@ def _rank_medal_all_time(idx: int) -> str:
         return "🥈"
     if idx == 4:
         return "🥉"
-    return "🏅"
 
 
 def _rank_medal_today(idx: int) -> str:
@@ -462,7 +461,6 @@ def _rank_medal_today(idx: int) -> str:
         return "🥈"
     if idx == 3:
         return "🥉"
-    return "🏅"
 
 
 async def format_rating_text(user_id: int) -> str:
