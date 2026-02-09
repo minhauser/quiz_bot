@@ -10,6 +10,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Set
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import aiosqlite
 from openpyxl import Workbook
 from aiogram import Bot, Dispatcher, F
@@ -27,19 +33,23 @@ from aiogram.types import (
 # =======================
 # CONFIGURATION
 # =======================
+# BOT_TOKEN and DB_PATH can be set via environment variables (e.g. on Railway).
+# For local development use .env or export BOT_TOKEN=... and optionally
+# DB_PATH=...
 
-BOT_TOKEN = "8396597732:AAF2pnbN88GnnXwuBxHdesL-WPKskStySrA"
-
-DB_PATH = "quiz_bot.db"
-WORDS_FILE = "words.json"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+DB_PATH = os.environ.get("DB_PATH", "quiz_bot.db")
+WORDS_FILE = os.environ.get("WORDS_FILE", "words.json")
 
 ADMIN_USERNAMES = {"Sunnatulla_Mamur_Korean", "Sunnatulla_Mamur"}
 
 LEVEL_BEGINNER = "초급"
 LEVEL_INTERMEDIATE = "중급"
 LEVEL_ADVANCED = "고급"
+QUIZ_MODE_AI = "ai"
 
 LEVEL_ORDER = [LEVEL_BEGINNER, LEVEL_INTERMEDIATE, LEVEL_ADVANCED]
+QUIZ_MODES = [LEVEL_BEGINNER, LEVEL_INTERMEDIATE, LEVEL_ADVANCED, QUIZ_MODE_AI]
 
 # how many in-a-row are needed to change level
 LEVEL_UP_CORRECT_STREAK = 20
@@ -164,6 +174,28 @@ MAIN_MENU_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+
+def build_quiz_level_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=" 🟢 초급", callback_data="quiz_lev:초급")],
+            [InlineKeyboardButton(text=" 🟡 중급", callback_data="quiz_lev:중급")],
+            [InlineKeyboardButton(text=" 🔴 고급", callback_data="quiz_lev:고급")],
+            [InlineKeyboardButton(text=" 🤖 AI Quiz", callback_data="quiz_lev:ai")],
+        ]
+    )
+
+
+def build_ranking_level_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=" 🟢 초급 랭킹", callback_data="rank_lev:초급")],
+            [InlineKeyboardButton(text=" 🟡 중급 랭킹", callback_data="rank_lev:중급")],
+            [InlineKeyboardButton(text=" 🔴 고급 랭킹", callback_data="rank_lev:고급")],
+            [InlineKeyboardButton(text=" 🤖 AI Quiz 랭킹", callback_data="rank_lev:ai")],
+        ]
+    )
+
 # =======================
 # DATABASE
 # =======================
@@ -200,7 +232,24 @@ async def init_db():
                 is_correct INTEGER NOT NULL,
                 delta_score INTEGER NOT NULL,
                 level TEXT NOT NULL,
+                quiz_mode TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+            """
+        )
+        cur = await db.execute("PRAGMA table_info(answers)")
+        answer_columns = [row[1] for row in await cur.fetchall()]
+        await cur.close()
+        if "quiz_mode" not in answer_columns:
+            await db.execute("ALTER TABLE answers ADD COLUMN quiz_mode TEXT DEFAULT 'ai'")
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_level_scores (
+                user_id INTEGER NOT NULL,
+                quiz_mode TEXT NOT NULL,
+                total_score INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, quiz_mode),
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
             """
@@ -294,17 +343,48 @@ async def log_answer(
     is_correct: bool,
     delta_score: int,
     level: str,
+    quiz_mode: str,
 ):
     now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO answers (user_id, word_id, is_correct, delta_score, level, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO answers (user_id, word_id, is_correct, delta_score, level, quiz_mode, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, word_id, int(is_correct), delta_score, level, now),
+            (user_id, word_id, int(is_correct), delta_score, level, quiz_mode, now),
         )
         await db.commit()
+
+
+async def get_level_score(user_id: int, quiz_mode: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT total_score FROM user_level_scores WHERE user_id = ? AND quiz_mode = ?",
+            (user_id, quiz_mode),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+    return row[0] if row else 0
+
+
+async def update_level_score(
+        user_id: int,
+        quiz_mode: str,
+        delta_score: int) -> int:
+    current = await get_level_score(user_id, quiz_mode)
+    new_score = max(0, current + delta_score)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO user_level_scores (user_id, quiz_mode, total_score)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, quiz_mode) DO UPDATE SET total_score = excluded.total_score
+            """,
+            (user_id, quiz_mode, new_score),
+        )
+        await db.commit()
+    return new_score
 
 
 # =======================
@@ -335,10 +415,10 @@ def build_question_text(word: dict) -> str:
     return "\n".join(lines)
 
 
-def build_options_keyboard(word: dict) -> InlineKeyboardMarkup:
+def build_options_keyboard(word: dict, quiz_mode: str) -> InlineKeyboardMarkup:
     buttons = []
     for idx, option in enumerate(word["options"]):
-        callback_data = f"ans:{word['id']}:{idx}"
+        callback_data = f"ans:{word['id']}:{idx}:{quiz_mode}"
         buttons.append([InlineKeyboardButton(
             text=f"{idx+1}) {option}", callback_data=callback_data)])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -360,12 +440,17 @@ def get_next_level_on_streak(
     return new_level
 
 
-async def send_quiz_question(message: Message, user_state: dict):
-    level = user_state["current_level"]
+async def send_quiz_question(
+        message: Message,
+        user_state: dict,
+        quiz_mode: str):
+    if quiz_mode == QUIZ_MODE_AI:
+        level = user_state["current_level"]
+    else:
+        level = quiz_mode
     word = choose_word_for_level(level)
     text = build_question_text(word)
-    kb = build_options_keyboard(word)
-
+    kb = build_options_keyboard(word, quiz_mode)
     await message.answer(text, reply_markup=kb)
 
 
@@ -374,73 +459,70 @@ async def send_quiz_question(message: Message, user_state: dict):
 # =======================
 
 
-async def get_all_time_top10():
+async def get_all_time_top10_by_mode(quiz_mode: str):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
-            SELECT user_id, COALESCE(username, ''), COALESCE(first_name, ''), total_score
-            FROM users
-            ORDER BY total_score DESC, user_id ASC
+            SELECT s.user_id, COALESCE(u.username, ''), COALESCE(u.first_name, ''), s.total_score
+            FROM user_level_scores s
+            JOIN users u ON u.user_id = s.user_id
+            WHERE s.quiz_mode = ?
+            ORDER BY s.total_score DESC, s.user_id ASC
             LIMIT 10
-            """
+            """,
+            (quiz_mode,),
         )
         rows = await cur.fetchall()
         await cur.close()
     return rows
 
 
-async def get_today_top10():
-    # today is determined in utc; for more precise local behavior this should
-    # use timezones
+async def get_today_top10_by_mode(quiz_mode: str):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
             SELECT a.user_id,
                    COALESCE(u.username, ''),
                    COALESCE(u.first_name, ''),
-                   CASE
-                       WHEN SUM(a.delta_score) < 0 THEN 0
-                       ELSE SUM(a.delta_score)
-                   END AS today_score
+                   SUM(a.delta_score) AS raw_score
             FROM answers a
             JOIN users u ON u.user_id = a.user_id
-            WHERE DATE(a.created_at) = DATE('now')
+            WHERE DATE(a.created_at) = DATE('now') AND a.quiz_mode = ?
             GROUP BY a.user_id
-            ORDER BY today_score DESC, a.user_id ASC
+            ORDER BY raw_score DESC, a.user_id ASC
             LIMIT 10
-            """
+            """,
+            (quiz_mode,),
         )
         rows = await cur.fetchall()
         await cur.close()
-    return rows
+    result = []
+    for uid, username, first_name, raw in rows:
+        today_score = max(0, raw) if raw is not None else 0
+        result.append((uid, username, first_name, today_score))
+    return result
 
 
-async def get_user_rank(user_id: int):
+async def get_user_rank_by_mode(user_id: int, quiz_mode: str):
+    score = await get_level_score(user_id, quiz_mode)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT total_score FROM users WHERE user_id = ?",
-            (user_id,),
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        if not row:
-            return None
-
-        total_score = row[0]
-
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM users WHERE total_score > ?",
-            (total_score,),
+            """
+            SELECT COUNT(*) FROM user_level_scores
+            WHERE quiz_mode = ? AND total_score > ?
+            """,
+            (quiz_mode, score),
         )
         higher_count = (await cur.fetchone())[0]
         await cur.close()
-
-        cur = await db.execute("SELECT COUNT(*) FROM users")
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM user_level_scores WHERE quiz_mode = ?",
+            (quiz_mode,),
+        )
         total_users = (await cur.fetchone())[0]
         await cur.close()
-
-        rank = higher_count + 1
-        return rank, total_users, total_score
+    rank = higher_count + 1
+    return rank, total_users, score
 
 
 def _rank_medal_all_time(idx: int) -> str:
@@ -465,14 +547,28 @@ def _rank_medal_today(idx: int) -> str:
     return ""
 
 
-async def format_rating_text(user_id: int) -> str:
-    all_time = await get_all_time_top10()
-    today = await get_today_top10()
-    user_rank_info = await get_user_rank(user_id)
+def _quiz_mode_label(quiz_mode: str) -> str:
+    return "AI Quiz" if quiz_mode == QUIZ_MODE_AI else quiz_mode
 
+
+def _quiz_mode_emoji_label(quiz_mode: str) -> str:
+    if quiz_mode == LEVEL_BEGINNER:
+        return "🟢초급"
+    if quiz_mode == LEVEL_INTERMEDIATE:
+        return "🟡중급"
+    if quiz_mode == LEVEL_ADVANCED:
+        return "🔴고급"
+    return "🤖AI Quiz"
+
+
+async def format_rating_text_by_mode(user_id: int, quiz_mode: str) -> str:
+    all_time = await get_all_time_top10_by_mode(quiz_mode)
+    today = await get_today_top10_by_mode(quiz_mode)
+    user_rank_info = await get_user_rank_by_mode(user_id, quiz_mode)
+
+    label = _quiz_mode_label(quiz_mode)
     lines: list[str] = []
-
-    lines.append("🏆 랭킹")
+    lines.append(f"🏆 랭킹 — {label}")
     lines.append("")
     lines.append("🔹 전체 TOP 10")
     if not all_time:
@@ -483,7 +579,6 @@ async def format_rating_text(user_id: int) -> str:
             name = username or first_name or str(uid)
             medal = _rank_medal_all_time(idx)
             lines.append(f"{medal}{idx}. {name} — {score}💎")
-
     lines.append("")
     lines.append("🔸 오늘 TOP 10")
     if not today:
@@ -494,15 +589,13 @@ async def format_rating_text(user_id: int) -> str:
             name = username or first_name or str(uid)
             medal = _rank_medal_today(idx)
             lines.append(f"{medal}{idx}. {name} — {score}💎")
-
     lines.append("")
-    if user_rank_info is None:
+    rank, total_users, total_score = user_rank_info
+    if total_users == 0:
         lines.append("내 순위: 아직 랭킹 정보가 없습니다.")
     else:
-        rank, total_users, total_score = user_rank_info
         lines.append(f"📊 내 순위: {rank}위 / 총 {total_users}명")
         lines.append(f"📈 내 총 점수: {total_score}💎")
-
     return "\n".join(lines)
 
 
@@ -844,33 +937,88 @@ async def cmd_start(message: Message):
 
 @dp.message(F.text == "🔠퀴즈")
 async def handle_quiz(message: Message):
-    user = await get_or_create_user(
+    await get_or_create_user(
         user_id=message.from_user.id,
         username=message.from_user.username,
         first_name=message.from_user.first_name,
     )
-    await send_quiz_question(message, user)
+    text = "🇰🇷 퀴즈 레벨을 선택하세요 🔠\n"
+
+    text += "\n 🇬🇧 Choose quiz level 🔠\n"
+
+    text += "\n 🇷🇺 Выберите уровень викторины 🔠\n"
+
+    text += "\n 🇺🇿 Viktorina darajasini tanlang 🔠\n"
+
+    await message.answer(text, reply_markup=build_quiz_level_keyboard())
+
+
+@dp.callback_query(F.data.startswith("quiz_lev:"))
+async def handle_quiz_level_selected(callback: CallbackQuery):
+    quiz_mode = callback.data.replace("quiz_lev:", "", 1)
+    if quiz_mode not in QUIZ_MODES:
+        await callback.answer("잘못된 선택입니다.", show_alert=True)
+        return
+    await callback.answer()
+    user = await get_or_create_user(
+        user_id=callback.from_user.id,
+        username=callback.from_user.username,
+        first_name=callback.from_user.first_name,
+    )
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    user_state = {
+        "user_id": user["user_id"],
+        "current_level": user["current_level"],
+        "total_score": user["total_score"],
+        "correct_streak": user["correct_streak"],
+        "wrong_streak": user["wrong_streak"],
+    }
+    await send_quiz_question(callback.message, user_state, quiz_mode)
 
 
 @dp.message(F.text == "📊랭킹")
 async def handle_rating(message: Message):
-    text = await format_rating_text(message.from_user.id)
-    await message.answer(text, reply_markup=MAIN_MENU_KB)
+    text = "🇰🇷 랭킹 레벨을 선택하세요 📊\n"
+
+    text += "\n 🇬🇧 Choose ranking level 📊\n"
+
+    text += "\n 🇷🇺 Выберите уровень рейтинга 📊\n"
+
+    text += "\n 🇺🇿 Reyting darajasini tanlang 📊\n"
+
+    await message.answer(text, reply_markup=build_ranking_level_keyboard())
+
+
+@dp.callback_query(F.data.startswith("rank_lev:"))
+async def handle_ranking_level_selected(callback: CallbackQuery):
+    quiz_mode = callback.data.replace("rank_lev:", "", 1)
+    if quiz_mode not in QUIZ_MODES:
+        await callback.answer("잘못된 선택입니다.", show_alert=True)
+        return
+    await callback.answer()
+    text = await format_rating_text_by_mode(callback.from_user.id, quiz_mode)
+    try:
+        await callback.message.edit_text(text)
+    except Exception:
+        await callback.message.answer(text, reply_markup=MAIN_MENU_KB)
 
 
 @dp.message(F.text == "🎁추천")
 async def handle_recommend(message: Message):
     text = (
-        "📚 무료 도서관 \n"
+        "📚 🇰🇷 무료 도서관 \n"
         "👉 https://t.me/SunnatullaMamur_Bot\n\n"
 
-        "📚 Free Library \n"
+        "📚 🇬🇧 Free Library \n"
         "👉 https://t.me/SunnatullaMamur_Bot\n\n"
 
-        "📚 Bepul Kutubxona \n"
+        "📚 🇺🇿 Bepul Kutubxona \n"
         "👉 https://t.me/SunnatullaMamur_Bot\n\n"
 
-        "📚 Бесплатная библиотека \n"
+        "📚 🇷🇺 Бесплатная библиотека \n"
         "👉 https://t.me/SunnatullaMamur_Bot\n"
     )
     await message.answer(text, reply_markup=MAIN_MENU_KB)
@@ -1202,14 +1350,19 @@ async def send_broadcast(bot: Bot, admin_id: int, broadcast_data: dict):
 @dp.callback_query(F.data.startswith("ans:"))
 async def handle_answer(callback: CallbackQuery):
     parts = callback.data.split(":")
-    if len(parts) != 3:
+    if len(parts) != 4:
         await callback.answer("잘못된 응답입니다.", show_alert=True)
         return
 
     try:
         word_id = int(parts[1])
         selected_index = int(parts[2])
-    except ValueError:
+        quiz_mode = parts[3]
+    except (ValueError, IndexError):
+        await callback.answer("잘못된 응답입니다.", show_alert=True)
+        return
+
+    if quiz_mode not in QUIZ_MODES:
         await callback.answer("잘못된 응답입니다.", show_alert=True)
         return
 
@@ -1228,68 +1381,71 @@ async def handle_answer(callback: CallbackQuery):
     is_correct = selected_index == correct_index
     delta_score = 1 if is_correct else -1
 
-    # do not allow total score to go below 0
-    total_score = user["total_score"] + delta_score
-    if total_score < 0:
-        total_score = 0
-    correct_streak = user["correct_streak"]
-    wrong_streak = user["wrong_streak"]
-
-    # streak updates must happen before deciding level change
-    if is_correct:
-        correct_streak += 1
-        wrong_streak = 0
-    else:
-        wrong_streak += 1
-        correct_streak = 0
-
-    current_level = user["current_level"]
-    new_level = get_next_level_on_streak(
-        current_level, correct_streak, wrong_streak)
-
-    level_changed = new_level != current_level
-    level_change_message = None
-
-    if level_changed:
-        if LEVEL_ORDER.index(new_level) > LEVEL_ORDER.index(current_level):
-            level_change_message = f"🎉 수준 상승! {current_level} → {new_level}"
+    if quiz_mode == QUIZ_MODE_AI:
+        total_score = user["total_score"] + delta_score
+        if total_score < 0:
+            total_score = 0
+        correct_streak = user["correct_streak"]
+        wrong_streak = user["wrong_streak"]
+        if is_correct:
+            correct_streak += 1
+            wrong_streak = 0
         else:
-            level_change_message = f"📉 수준 하락. {current_level} → {new_level}"
-        # once level changes, streaks restart to avoid immediate multiple jumps
-        correct_streak = 0
-        wrong_streak = 0
-        current_level = new_level
+            wrong_streak += 1
+            correct_streak = 0
+        current_level = user["current_level"]
+        new_level = get_next_level_on_streak(
+            current_level, correct_streak, wrong_streak)
+        level_changed = new_level != current_level
+        level_change_message = None
+        if level_changed:
+            if LEVEL_ORDER.index(new_level) > LEVEL_ORDER.index(current_level):
+                level_change_message = f"🎉 수준 상승! {current_level} → {new_level}"
+            else:
+                level_change_message = f"📉 수준 하락. {current_level} → {new_level}"
+            correct_streak = 0
+            wrong_streak = 0
+            current_level = new_level
+        await update_user_stats(
+            user_id=user["user_id"],
+            total_score=total_score,
+            current_level=current_level,
+            correct_streak=correct_streak,
+            wrong_streak=wrong_streak,
+        )
+    else:
+        level_changed = False
+        level_change_message = None
+        current_level = quiz_mode
+
+    await update_level_score(user["user_id"], quiz_mode, delta_score)
+    display_score = await get_level_score(user["user_id"], quiz_mode)
 
     await log_answer(
         user_id=user["user_id"],
         word_id=word_id,
         is_correct=is_correct,
         delta_score=delta_score,
-        level=current_level,
-    )
-    await update_user_stats(
-        user_id=user["user_id"],
-        total_score=total_score,
-        current_level=current_level,
-        correct_streak=correct_streak,
-        wrong_streak=wrong_streak,
+        level=current_level if quiz_mode == QUIZ_MODE_AI else word["level"],
+        quiz_mode=quiz_mode,
     )
 
-    user_rank_info = await get_user_rank(user["user_id"])
+    user_rank_info = await get_user_rank_by_mode(user["user_id"], quiz_mode)
+    level_label = _quiz_mode_emoji_label(quiz_mode)
     rank_line = ""
-    if user_rank_info is not None:
+    if user_rank_info:
         rank, _, _ = user_rank_info
-        rank_line = f"\n📈내 순위: {rank} 위"
-    score_line = f"\n📊내 점수: {total_score}💎{rank_line}"
+        rank_line = f"\n📈내 {level_label} 순위: {rank} 위"
+    score_line = f"\n📊내 {level_label} 점수: {display_score}💎{rank_line}"
 
     if is_correct:
-        feedback = "✅ 정답입니다!\n\n+1💎" + score_line
+        feedback = f"✅ 정답입니다!\n\n{level_label} +1💎\n" + score_line
     else:
         correct_option_text = word["options"][correct_index]
         feedback = (
             "❌ 틀렸습니다.\n\n"
             f"정답: {correct_index+1}) {correct_option_text}\n\n"
-            f"-1💎{score_line}"
+            f"{level_label} -1💎\n{score_line}"
         )
 
     if level_changed and level_change_message:
@@ -1299,15 +1455,23 @@ async def handle_answer(callback: CallbackQuery):
     await callback.message.answer(feedback, reply_markup=MAIN_MENU_KB)
     await callback.answer()
 
-    # immediately send next question so learning stays continuous
-    user_state = {
-        "user_id": user["user_id"],
-        "current_level": current_level,
-        "total_score": total_score,
-        "correct_streak": correct_streak,
-        "wrong_streak": wrong_streak,
-    }
-    await send_quiz_question(callback.message, user_state)
+    if quiz_mode == QUIZ_MODE_AI:
+        user_state = {
+            "user_id": user["user_id"],
+            "current_level": current_level,
+            "total_score": total_score,
+            "correct_streak": correct_streak,
+            "wrong_streak": wrong_streak,
+        }
+    else:
+        user_state = {
+            "user_id": user["user_id"],
+            "current_level": user["current_level"],
+            "total_score": user["total_score"],
+            "correct_streak": user["correct_streak"],
+            "wrong_streak": user["wrong_streak"],
+        }
+    await send_quiz_question(callback.message, user_state, quiz_mode)
 
 
 @dp.message(Command("cancel"))
@@ -1423,8 +1587,10 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
 
-    if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        raise RuntimeError("Please set BOT_TOKEN to your Telegram bot token.")
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "Set BOT_TOKEN environment variable (e.g. in Railway: Variables tab)."
+        )
 
     bot = Bot(token=BOT_TOKEN)
     await dp.start_polling(bot)
